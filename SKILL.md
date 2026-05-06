@@ -1,3 +1,8 @@
+---
+name: modal-telemetry
+description: Instrument Modal Python scripts with squaretower telemetry. Use whenever writing, modifying, or reviewing code that defines a modal.App, an @app.function, or a Modal .remote()/.spawn()/.map() call. Adds GPU-second tracking, workload metadata, and OTLP egress to Squaretower's collector. Works on every Modal plan including free.
+---
+
 # Modal workload telemetry (Squaretower)
 
 When you write or modify a Modal script in this project, instrument it
