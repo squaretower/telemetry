@@ -1,0 +1,55 @@
+# Drop this file next to SigNoz's deploy/docker/docker-compose.yaml.
+#
+#   git clone https://github.com/SigNoz/signoz
+#   cp infra/docker-compose.override.yml signoz/deploy/docker/
+#   cp infra/Caddyfile                    signoz/deploy/docker/
+#   cp infra/.env.example                 signoz/deploy/docker/.env
+#   cd signoz/deploy/docker && docker compose up -d
+#
+# What this override does:
+#   1. Bind-mounts ClickHouse data onto the attached DO block volume
+#      (mounted on the host at /mnt/clickhouse_data) so the data survives
+#      droplet rebuilds.
+#   2. Stops SigNoz from publishing the OTLP and UI ports directly. Caddy
+#      is the only thing on 80/443; everything else stays on the internal
+#      docker network.
+#   3. Adds Caddy with auto-TLS (Let's Encrypt) + bearer-auth on OTLP
+#      ingest + basic-auth on the SigNoz UI.
+
+services:
+  clickhouse:
+    volumes:
+      - /mnt/clickhouse_data:/var/lib/clickhouse
+
+  otel-collector:
+    ports: !reset []        # don't publish 4317/4318 to the host
+
+  signoz:
+    ports: !reset []        # don't publish UI port to the host
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    networks:
+      - signoz-net
+    depends_on:
+      - signoz
+      - otel-collector
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SIGNOZ_DOMAIN: ${SIGNOZ_DOMAIN}
+      OTLP_DOMAIN: ${OTLP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+      OTLP_BEARER_TOKEN: ${OTLP_BEARER_TOKEN}
+      UI_BASICAUTH_USER: ${UI_BASICAUTH_USER}
+      UI_BASICAUTH_HASH: ${UI_BASICAUTH_HASH}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

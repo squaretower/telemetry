@@ -1,0 +1,22 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# OTLP ingest — bearer-token auth, forwards to SigNoz's collector.
+# Modal containers POST traces to https://{$OTLP_DOMAIN}/v1/traces
+# with header  Authorization: Bearer {$OTLP_BEARER_TOKEN}
+{$OTLP_DOMAIN} {
+	@authorized header Authorization "Bearer {$OTLP_BEARER_TOKEN}"
+	handle @authorized {
+		reverse_proxy otel-collector:4318
+	}
+	handle {
+		respond "unauthorized" 401
+	}
+}
+
+# SigNoz UI — TLS-terminate only. Auth is handled by SigNoz's own login;
+# adding Caddy basic_auth on top breaks the SPA's XHR calls.
+{$SIGNOZ_DOMAIN} {
+	reverse_proxy signoz:8080
+}

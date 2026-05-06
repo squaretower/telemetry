@@ -1,0 +1,205 @@
+#cloud-config
+# DigitalOcean droplet bootstrap for the SigNoz + Caddy telemetry stack.
+#
+# Usage:
+#   1. Create a DO block storage volume (e.g. 100 GB) named `clickhouse-data`
+#      in the same region as the droplet. Do NOT pre-format it via the DO
+#      UI — this script formats it once on first boot if empty.
+#   2. Create the droplet, attaching that volume:
+#
+#        doctl compute droplet create signoz-prod \
+#          --region nyc3 \
+#          --size s-2vcpu-4gb \
+#          --image ubuntu-24-04-x64 \
+#          --ssh-keys <your-key-fingerprint> \
+#          --volumes <volume-id-from-step-1> \
+#          --user-data-file infra/cloud-init.yaml \
+#          --wait
+#
+#   3. Point DNS A records for SIGNOZ_DOMAIN and OTLP_DOMAIN at the
+#      droplet's public IP. Wait for propagation.
+#   4. SSH in, edit /opt/signoz/deploy/docker/.env (token + bcrypt hash +
+#      domains), then:
+#        cd /opt/signoz/deploy/docker && docker compose up -d
+#
+# What this does on first boot:
+#   - installs Docker CE + compose plugin
+#   - formats /dev/disk/by-id/scsi-0DO_Volume_clickhouse-data as ext4 IF
+#     it has no filesystem (idempotent — safe to re-run on rebuild)
+#   - mounts it at /mnt/clickhouse_data and adds an fstab entry
+#   - clones SigNoz into /opt/signoz
+#   - drops the override, Caddyfile, and .env.example into place
+#   - opens ufw for 22/80/443 only
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - gnupg
+  - ufw
+
+write_files:
+  - path: /opt/signoz-infra/docker-compose.override.yml
+    permissions: "0644"
+    content: |
+      services:
+        clickhouse:
+          volumes:
+            - /mnt/clickhouse_data:/var/lib/clickhouse
+
+        otel-collector:
+          ports: !reset []
+
+        frontend:
+          ports: !reset []
+
+        caddy:
+          image: caddy:2
+          restart: unless-stopped
+          depends_on:
+            - frontend
+            - otel-collector
+          ports:
+            - "80:80"
+            - "443:443"
+          environment:
+            SIGNOZ_DOMAIN: ${SIGNOZ_DOMAIN}
+            OTLP_DOMAIN: ${OTLP_DOMAIN}
+            ACME_EMAIL: ${ACME_EMAIL}
+            OTLP_BEARER_TOKEN: ${OTLP_BEARER_TOKEN}
+            UI_BASICAUTH_USER: ${UI_BASICAUTH_USER}
+            UI_BASICAUTH_HASH: ${UI_BASICAUTH_HASH}
+          volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile:ro
+            - caddy_data:/data
+            - caddy_config:/config
+
+      volumes:
+        caddy_data:
+        caddy_config:
+
+  - path: /opt/signoz-infra/Caddyfile
+    permissions: "0644"
+    content: |
+      {
+      	email {$ACME_EMAIL}
+      }
+
+      {$OTLP_DOMAIN} {
+      	@authorized header Authorization "Bearer {$OTLP_BEARER_TOKEN}"
+      	handle @authorized {
+      		reverse_proxy otel-collector:4318
+      	}
+      	handle {
+      		respond "unauthorized" 401
+      	}
+      }
+
+      {$SIGNOZ_DOMAIN} {
+      	basic_auth {
+      		{$UI_BASICAUTH_USER} {$UI_BASICAUTH_HASH}
+      	}
+      	reverse_proxy frontend:3301
+      }
+
+  - path: /opt/signoz-infra/.env.example
+    permissions: "0644"
+    content: |
+      SIGNOZ_DOMAIN=signoz.yourdomain.com
+      OTLP_DOMAIN=otel.yourdomain.com
+      ACME_EMAIL=mail@mackaygrant.com
+      # openssl rand -hex 32
+      OTLP_BEARER_TOKEN=replace-me
+      UI_BASICAUTH_USER=admin
+      # docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
+      UI_BASICAUTH_HASH=$2a$14$replace.with.actual.bcrypt.hash
+
+  - path: /usr/local/sbin/signoz-bootstrap.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      VOLUME_DEV=/dev/disk/by-id/scsi-0DO_Volume_clickhouse-data
+      MOUNT=/mnt/clickhouse_data
+
+      # Format the block volume once, only if it has no filesystem.
+      if [ -e "$VOLUME_DEV" ]; then
+        if ! blkid "$VOLUME_DEV" >/dev/null 2>&1; then
+          echo "formatting $VOLUME_DEV as ext4 (no existing filesystem)"
+          mkfs.ext4 -L clickhouse "$VOLUME_DEV"
+        else
+          echo "$VOLUME_DEV already has a filesystem, skipping format"
+        fi
+        mkdir -p "$MOUNT"
+        if ! grep -q "$MOUNT" /etc/fstab; then
+          echo "$VOLUME_DEV $MOUNT ext4 defaults,nofail,discard 0 2" >> /etc/fstab
+        fi
+        mount -a
+        chown -R 101:101 "$MOUNT"   # ClickHouse container UID
+      else
+        echo "WARNING: block volume not attached at $VOLUME_DEV"
+        echo "Re-run after attaching the volume named 'clickhouse-data'."
+        exit 1
+      fi
+
+      # Install Docker (official repo).
+      if ! command -v docker >/dev/null; then
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+        . /etc/os-release
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+      https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
+          > /etc/apt/sources.list.d/docker.list
+        apt-get update -y
+        apt-get install -y docker-ce docker-ce-cli containerd.io \
+          docker-buildx-plugin docker-compose-plugin
+        systemctl enable --now docker
+      fi
+
+      # Clone SigNoz and drop our overrides in.
+      if [ ! -d /opt/signoz ]; then
+        git clone https://github.com/SigNoz/signoz /opt/signoz
+      fi
+      cp /opt/signoz-infra/docker-compose.override.yml /opt/signoz/deploy/docker/
+      cp /opt/signoz-infra/Caddyfile                    /opt/signoz/deploy/docker/
+      if [ ! -f /opt/signoz/deploy/docker/.env ]; then
+        cp /opt/signoz-infra/.env.example /opt/signoz/deploy/docker/.env
+      fi
+
+      # Firewall.
+      ufw --force reset
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow 22/tcp
+      ufw allow 80/tcp
+      ufw allow 443/tcp
+      ufw --force enable
+
+      cat <<EOF
+
+      ============================================================
+      Bootstrap complete. Next steps (do NOT run as root via cloud-init —
+      do these yourself over SSH so secrets aren't logged):
+
+        1. Edit /opt/signoz/deploy/docker/.env
+             - set SIGNOZ_DOMAIN, OTLP_DOMAIN, ACME_EMAIL
+             - OTLP_BEARER_TOKEN=\$(openssl rand -hex 32)
+             - UI_BASICAUTH_HASH=\$(docker run --rm caddy:2 \\
+                 caddy hash-password --plaintext 'your-password')
+        2. Confirm DNS A records resolve to this droplet's IP.
+        3. cd /opt/signoz/deploy/docker && docker compose up -d
+        4. Create the Modal secret on your laptop:
+             modal secret create squaretower-telemetry \\
+               ST_TELEMETRY_ENDPOINT=https://\$OTLP_DOMAIN \\
+               ST_TELEMETRY_API_KEY=\$OTLP_BEARER_TOKEN
+      ============================================================
+      EOF
+
+runcmd:
+  - [ /usr/local/sbin/signoz-bootstrap.sh ]
